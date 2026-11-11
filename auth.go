@@ -18,12 +18,14 @@ import (
 )
 
 const (
-	pbkdf2Iter     = 600_000 // recommandation OWASP pour PBKDF2-HMAC-SHA256
 	maxPbkdf2Iter  = 10_000_000
 	minPasswordLen = 10
 )
 
 var b64 = base64.RawStdEncoding
+
+// pbkdf2Iter : recommandation OWASP pour PBKDF2-HMAC-SHA256 (variable pour les tests).
+var pbkdf2Iter = 600_000
 
 // HashPassword produit "pbkdf2-sha256$iter$sel$hash".
 func HashPassword(pw string) (string, error) {
@@ -127,6 +129,22 @@ func (u *UserStore) Verify(name, pw string) bool {
 	return verifyHash(pw, stored)
 }
 
+// VerifyHash vérifie un mot de passe contre un hash arbitraire (opérateurs),
+// avec la même borne de concurrence que Verify. Un hash vide vérifie le hash factice.
+func (u *UserStore) VerifyHash(pw, stored string) bool {
+	select {
+	case u.sem <- struct{}{}:
+		defer func() { <-u.sem }()
+	case <-time.After(2 * time.Second):
+		return false
+	}
+	if stored == "" {
+		verifyHash(pw, u.dummy)
+		return false
+	}
+	return verifyHash(pw, stored)
+}
+
 func (u *UserStore) Set(name, pw string) error {
 	if !validNick(name) {
 		return errors.New("nom de compte invalide")
@@ -177,6 +195,40 @@ func (u *UserStore) save() error {
 		return err
 	}
 	return os.Rename(tmp.Name(), u.path)
+}
+
+// rateLimiter limite le nombre d'événements par IP sur une fenêtre d'une minute.
+type rateLimiter struct {
+	mu   sync.Mutex
+	max  int
+	hits map[string][]time.Time
+}
+
+func newRateLimiter(max int) *rateLimiter {
+	return &rateLimiter{max: max, hits: map[string][]time.Time{}}
+}
+
+func (r *rateLimiter) Allow(ip string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	if len(r.hits) > 10000 {
+		for k, v := range r.hits {
+			if len(v) == 0 || now.Sub(v[len(v)-1]) > time.Minute {
+				delete(r.hits, k)
+			}
+		}
+	}
+	h := r.hits[ip]
+	for len(h) > 0 && now.Sub(h[0]) > time.Minute {
+		h = h[1:]
+	}
+	if len(h) >= r.max {
+		r.hits[ip] = h
+		return false
+	}
+	r.hits[ip] = append(h, now)
+	return true
 }
 
 // authThrottle bloque temporairement les IP qui accumulent les échecs.

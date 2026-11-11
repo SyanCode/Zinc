@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 )
@@ -15,9 +17,13 @@ import (
 const usage = `Zinc — serveur IRC sécurisé (TLS obligatoire, comptes PBKDF2, SASL PLAIN)
 
 Usage:
-  zinc serve   [-config zinc.json]
+  zinc serve   [-config zinc.json]            lance le serveur
+  zinc check   [-config zinc.json]            valide la configuration
   zinc useradd [-config zinc.json] <compte>   crée ou change le mot de passe (lu sur stdin)
-  zinc userdel [-config zinc.json] <compte>
+  zinc userdel [-config zinc.json] <compte>   supprime un compte
+  zinc users   [-config zinc.json]            liste les comptes
+  zinc hash                                   hash PBKDF2 d'un mot de passe (pour "opers" dans la config)
+  zinc version
 `
 
 func main() {
@@ -26,6 +32,18 @@ func main() {
 		os.Exit(2)
 	}
 	cmd := os.Args[1]
+	switch cmd {
+	case "version":
+		fmt.Println("zinc", version)
+		return
+	case "hash":
+		h, err := HashPassword(readPassword())
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println(h)
+		return
+	}
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 	cfgPath := fs.String("config", "", "fichier de configuration JSON")
 	fs.Parse(os.Args[2:])
@@ -35,7 +53,22 @@ func main() {
 	}
 	switch cmd {
 	case "serve":
-		serve(cfg)
+		serve(cfg, *cfgPath)
+	case "check":
+		fmt.Println("configuration valide")
+	case "users":
+		users, err := LoadUsers(cfg.UsersFile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		users.mu.RLock()
+		var names []string
+		for n := range users.users {
+			names = append(names, n)
+		}
+		users.mu.RUnlock()
+		sort.Strings(names)
+		fmt.Println(strings.Join(names, "\n"))
 	case "useradd", "userdel":
 		if fs.NArg() != 1 {
 			fmt.Fprint(os.Stderr, usage)
@@ -78,11 +111,19 @@ func readPassword() string {
 	return strings.TrimRight(line, "\r\n")
 }
 
-func serve(cfg Config) {
+func serve(cfg Config, cfgPath string) {
+	if cfg.LogFile != "" {
+		lf, err := os.OpenFile(cfg.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.SetOutput(io.MultiWriter(os.Stderr, lf))
+	}
 	s, err := NewServer(cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
+	s.cfgPath = cfgPath
 	if err := s.Listen(); err != nil {
 		log.Fatal(err)
 	}
@@ -92,10 +133,10 @@ func serve(cfg Config) {
 	go func() {
 		for sg := range sig {
 			if sg == syscall.SIGHUP {
-				if err := s.users.Reload(); err != nil {
-					logf("rechargement des comptes: %v", err)
+				if err := s.Rehash(); err != nil {
+					logf("rechargement: %v", err)
 				} else {
-					logf("comptes rechargés")
+					logf("configuration rechargée")
 				}
 				continue
 			}

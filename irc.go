@@ -156,3 +156,57 @@ func parseMessage(line string) (*Message, bool) {
 	}
 	return m, true
 }
+
+// wildMatch compare un motif avec * et ? (insensible à la casse IRC).
+func wildMatch(pattern, s string) bool {
+	p, t := []rune(fold(pattern)), []rune(fold(s))
+	pi, ti, star, mark := 0, 0, -1, 0
+	for ti < len(t) {
+		switch {
+		case pi < len(p) && (p[pi] == '?' || p[pi] == t[ti]):
+			pi++
+			ti++
+		case pi < len(p) && p[pi] == '*':
+			star, mark = pi, ti
+			pi++
+		case star >= 0:
+			pi, mark = star+1, mark+1
+			ti = mark
+		default:
+			return false
+		}
+	}
+	for pi < len(p) && p[pi] == '*' {
+		pi++
+	}
+	return pi == len(p)
+}
+
+// normalizeMask complète un masque de ban : "nick" -> nick!*@*, "u@h" -> *!u@h.
+func normalizeMask(m string) string {
+	m = cleanText(truncate(m, 100))
+	if strings.HasPrefix(m, "$a") {
+		return m
+	}
+	switch {
+	case !strings.ContainsAny(m, "!@"):
+		return m + "!*@*"
+	case !strings.Contains(m, "!"):
+		return "*!" + m
+	case !strings.Contains(m, "@"):
+		return m + "@*"
+	}
+	return m
+}
+
+func memberPrefix(mem *Member, multi bool) string {
+	switch {
+	case mem.op && mem.voice && multi:
+		return "@+"
+	case mem.op:
+		return "@"
+	case mem.voice:
+		return "+"
+	}
+	return ""
+}

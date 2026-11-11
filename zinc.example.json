@@ -1,0 +1,35 @@
+{
+  "name": "irc.exemple.org",
+  "network": "Zinc",
+  "listen": ":6697",
+  "cert_file": "fullchain.pem",
+  "key_file": "privkey.pem",
+  "users_file": "users.json",
+  "motd_file": "motd.txt",
+  "log_file": "zinc.log",
+
+  "require_auth": true,
+  "tls13_only": false,
+  "auth_max_fails": 8,
+  "cloak_secret": "changez-moi-par-une-longue-valeur-aleatoire",
+
+  "max_clients": 1000,
+  "max_per_ip": 5,
+  "connect_rate": 20,
+  "max_channels": 2000,
+  "ping_interval": 90,
+  "reg_timeout": 30,
+
+  "default_modes": "nt",
+  "history_lines": 50,
+
+  "admin_name": "Votre nom",
+  "admin_email": "admin@exemple.org",
+
+  "opers": {
+    "root": "pbkdf2-sha256$600000$... (sortie de: zinc hash)"
+  },
+  "certfp": {
+    "0123456789abcdef...(sha256 du certificat client)": "alice"
+  }
+}

@@ -33,9 +33,14 @@ func LoadTLS(cfg Config) (*tls.Config, error) {
 	}
 	sum := sha256.Sum256(cert.Certificate[0])
 	logf("empreinte SHA-256 du certificat: %s", hex.EncodeToString(sum[:]))
+	min := uint16(tls.VersionTLS12)
+	if cfg.TLS13Only {
+		min = tls.VersionTLS13
+	}
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
+		MinVersion:   min,
+		ClientAuth:   tls.RequestClientCert, // certificat client optionnel (SASL EXTERNAL)
 		CipherSuites: []uint16{ // TLS 1.2 : uniquement ECDHE + AEAD (TLS 1.3 est géré par Go)
 			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
 			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,

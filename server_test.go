@@ -5,16 +5,27 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
 
+func TestMain(m *testing.M) {
+	pbkdf2Iter = 1000 // tests rapides
+	os.Exit(m.Run())
+}
+
 func testServer(t *testing.T, requireAuth bool) *Server {
 	t.Helper()
 	dir := t.TempDir()
 	cfg := DefaultConfig()
+	cfg.HistoryLines = 10
+	cfg.ConnectRate = 1000
+	cfg.MaxPerIP = 50
+	hash, _ := HashPassword("oper-password")
+	cfg.Opers = map[string]string{"root": hash}
 	cfg.Listen = "127.0.0.1:0"
 	cfg.CertFile = filepath.Join(dir, "c.crt")
 	cfg.KeyFile = filepath.Join(dir, "c.key")
@@ -193,5 +204,139 @@ func TestParse(t *testing.T) {
 	m, _ = parseMessage("PRIVMSG #c :a\x00b\rc")
 	if m.Params[1] != "abc" {
 		t.Fatalf("caractères de contrôle non filtrés: %q", m.Params[1])
+	}
+}
+
+func reg(t *testing.T, s *Server, nick string) *tc {
+	x := dial(t, s)
+	x.send("NICK " + nick)
+	x.send("USER u 0 * :" + nick)
+	x.expect(" 001 ")
+	return x
+}
+
+func TestBan(t *testing.T) {
+	s := testServer(t, false)
+	a, b := reg(t, s, "ann"), reg(t, s, "bob")
+	a.send("JOIN #b")
+	a.expect(" 366 ")
+	a.send("MODE #b +b bob")
+	a.expect("+b bob!*@*")
+	b.send("JOIN #b")
+	b.expect(" 474 ")
+	a.send("MODE #b +b")
+	a.expect(" 367 ")
+	a.send("MODE #b -b bob")
+	a.expect("-b bob!*@*")
+	b.send("JOIN #b")
+	b.expect(" 366 ")
+}
+
+func TestRegisteredOnlyChannel(t *testing.T) {
+	s := testServer(t, false)
+	a, b := reg(t, s, "ann"), reg(t, s, "bob")
+	a.send("JOIN #r")
+	a.send("MODE #r +R")
+	a.expect("MODE #r +R")
+	b.send("JOIN #r")
+	b.expect(" 477 ")
+}
+
+func TestOperKillKline(t *testing.T) {
+	s := testServer(t, false)
+	o, v := reg(t, s, "opr"), reg(t, s, "vic")
+	v.send("KILL opr x")
+	v.expect(" 481 ")
+	o.send("OPER root mauvais")
+	o.expect(" 464 ")
+	o.send("OPER root oper-password")
+	o.expect(" 381 ")
+	o.send("KILL vic spam")
+	v.expect("Killed")
+	o.send("KLINE 127.0.0.* test")
+	o.expect("K-Line ajouté")
+	c, err := tls.Dial("tcp", s.Addr(), &tls.Config{InsecureSkipVerify: true})
+	if err == nil {
+		defer c.Close()
+		c.Write([]byte("NICK z\r\nUSER z 0 * :z\r\n"))
+		c.SetReadDeadline(time.Now().Add(3 * time.Second))
+		if n, _ := c.Read(make([]byte, 64)); n > 0 {
+			t.Fatal("IP klinée acceptée")
+		}
+	}
+	o.send("UNKLINE 127.0.0.*")
+	o.expect("K-Line retiré")
+}
+
+func TestIRCv3(t *testing.T) {
+	s := testServer(t, false)
+	a := dial(t, s)
+	a.send("CAP LS 302")
+	a.expect("multi-prefix")
+	a.send("CAP REQ :server-time echo-message multi-prefix")
+	a.expect("ACK")
+	a.send("CAP REQ :bogus")
+	a.expect("NAK")
+	a.send("NICK ann")
+	a.send("USER u 0 * :ann")
+	a.send("CAP END")
+	a.expect(" 001 ")
+	a.send("JOIN #c")
+	a.expect(" 366 ")
+	a.send("PRIVMSG #c :hello")
+	l := a.expect("PRIVMSG #c :hello") // echo-message
+	if !strings.HasPrefix(l, "@time=") {
+		t.Fatalf("server-time absent: %q", l)
+	}
+	// historique rejoué au 2e join
+	b := reg(t, s, "bob") // garde le salon (et son historique) en vie
+	b.send("JOIN #c")
+	b.expect(" 366 ")
+	a.send("PART #c")
+	a.send("JOIN #c")
+	a.expect("PRIVMSG #c :hello")
+}
+
+func TestMisc(t *testing.T) {
+	s := testServer(t, false)
+	a := reg(t, s, "ann")
+	a.send("LUSERS")
+	a.expect(" 251 ")
+	a.send("VERSION")
+	a.expect(" 351 ")
+	a.send("ISON ann nobody")
+	a.expect(" 303 ")
+	a.send("USERHOST ann")
+	a.expect(" 302 ")
+	a.send("KNOCK #nope")
+	a.expect(" 403 ")
+}
+
+func TestPasswd(t *testing.T) {
+	s := testServer(t, true)
+	x := dial(t, s)
+	x.send("PASS alice:correct horse battery")
+	x.send("NICK alice")
+	x.send("USER a 0 * :a")
+	x.expect(" 001 ")
+	x.send("PASSWD mauvais nouveaumotdepasse")
+	x.expect("incorrect")
+	s.users.Set("alice", "ancien-mot-de-passe")
+	x.send("PASSWD ancien-mot-de-passe nouveau-mot-de-passe")
+	x.expect("Mot de passe changé")
+	if !s.users.Verify("alice", "nouveau-mot-de-passe") {
+		t.Fatal("le mot de passe n'a pas changé")
+	}
+}
+
+func TestWildMatch(t *testing.T) {
+	for _, c := range []struct {
+		p, s string
+		ok   bool
+	}{{"*", "x", true}, {"a*c", "abbc", true}, {"a?c", "abc", true}, {"a?c", "ac", false},
+		{"*!*@zn-*", "n!u@zn-1.cloak", true}, {"BOB!*@*", "bob!u@h", true}, {"a*b", "ac", false}} {
+		if wildMatch(c.p, c.s) != c.ok {
+			t.Errorf("wildMatch(%q,%q) != %v", c.p, c.s, c.ok)
+		}
 	}
 }

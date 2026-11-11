@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 )
 
 // Config est la configuration du serveur. Les valeurs par défaut sont
@@ -25,6 +26,16 @@ type Config struct {
 	PingInterval int    `json:"ping_interval"`  // secondes d'inactivité avant PING
 	RegTimeout   int    `json:"reg_timeout"`    // secondes allouées pour s'enregistrer
 	AuthMaxFails int    `json:"auth_max_fails"` // échecs d'auth avant blocage de l'IP
+
+	TLS13Only    bool              `json:"tls13_only"`    // refuse TLS 1.2
+	ConnectRate  int               `json:"connect_rate"`  // connexions max par IP et par minute
+	HistoryLines int               `json:"history_lines"` // lignes rejouées à l'arrivée dans un salon (0 = désactivé)
+	LogFile      string            `json:"log_file"`      // journal d'audit (en plus de stderr)
+	Opers        map[string]string `json:"opers"`         // opérateurs : nom -> hash (voir "zinc hash")
+	CertFP       map[string]string `json:"certfp"`        // SASL EXTERNAL : empreinte SHA-256 du certificat client -> compte
+	AdminName    string            `json:"admin_name"`    // commande ADMIN
+	AdminEmail   string            `json:"admin_email"`
+	DefaultModes string            `json:"default_modes"` // modes appliqués aux nouveaux salons (défaut "nt")
 }
 
 func DefaultConfig() Config {
@@ -42,6 +53,8 @@ func DefaultConfig() Config {
 		PingInterval: 90,
 		RegTimeout:   30,
 		AuthMaxFails: 8,
+		ConnectRate:  20,
+		DefaultModes: "nt",
 	}
 }
 
@@ -60,6 +73,18 @@ func LoadConfig(path string) (Config, error) {
 	dec.DisallowUnknownFields() // une faute de frappe de sécurité ne doit pas passer en silence
 	if err := dec.Decode(&cfg); err != nil {
 		return cfg, fmt.Errorf("config invalide: %w", err)
+	}
+	for fp, acct := range cfg.CertFP {
+		delete(cfg.CertFP, fp)
+		cfg.CertFP[strings.ToLower(strings.ReplaceAll(fp, ":", ""))] = acct
+	}
+	for _, m := range cfg.DefaultModes {
+		if !strings.ContainsRune("imnRst", m) {
+			return cfg, fmt.Errorf("config invalide: default_modes ne peut contenir que i m n R s t")
+		}
+	}
+	if cfg.ConnectRate < 1 || cfg.HistoryLines < 0 || cfg.HistoryLines > 200 {
+		return cfg, fmt.Errorf("config invalide: connect_rate ou history_lines hors limites")
 	}
 	if cfg.MaxClients < 1 || cfg.MaxPerIP < 1 || cfg.PingInterval < 5 || cfg.RegTimeout < 5 || cfg.AuthMaxFails < 1 {
 		return cfg, fmt.Errorf("config invalide: valeurs numériques hors limites")

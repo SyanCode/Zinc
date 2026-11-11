@@ -1,0 +1,31 @@
+[Unit]
+Description=Zinc IRC (TLS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/zinc serve -config /etc/zinc/zinc.json
+ExecReload=/bin/kill -HUP $MAINPID
+DynamicUser=yes
+StateDirectory=zinc
+WorkingDirectory=/var/lib/zinc
+Restart=on-failure
+# Durcissement
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

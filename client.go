@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -31,11 +33,14 @@ type Client struct {
 	registered       bool
 	channels         map[string]*Channel
 	away             string
+	oper             bool
 
 	// Champs privés à la goroutine de lecture.
 	gotNick, gotUser bool
 	capNegotiating   bool
-	saslCap          bool
+	caps             map[string]bool // capacités IRCv3 activées
+	certfp           string          // empreinte SHA-256 du certificat client (si présenté)
+	saslMech         string
 	saslBuf          string
 	saslActive       bool
 	passAuthed       bool
@@ -54,10 +59,10 @@ type Client struct {
 func newClient(s *Server, conn net.Conn, ip string) *Client {
 	return &Client{
 		srv: s, conn: conn, ip: ip, host: s.cloak(ip),
-		channels: map[string]*Channel{},
-		out:      make(chan string, sendQSize),
-		done:     make(chan struct{}),
-		bucket:   floodBurst, bucketAt: time.Now(),
+		channels: map[string]*Channel{}, caps: map[string]bool{},
+		out:    make(chan string, sendQSize),
+		done:   make(chan struct{}),
+		bucket: floodBurst, bucketAt: time.Now(),
 	}
 }
 
@@ -71,7 +76,10 @@ func (c *Client) nickOr() string {
 }
 
 // send met une ligne en file. Jamais bloquant : un client trop lent est déconnecté.
-func (c *Client) send(format string, args ...any) {
+func (c *Client) send(format string, args ...any) { c.sendAt(time.Now(), format, args...) }
+
+// sendAt est send avec un horodatage explicite (rejeu d'historique).
+func (c *Client) sendAt(t time.Time, format string, args ...any) {
 	line := fmt.Sprintf(format, args...)
 	line = strings.Map(func(r rune) rune {
 		if r == '\r' || r == '\n' || r == 0 {
@@ -79,7 +87,11 @@ func (c *Client) send(format string, args ...any) {
 		}
 		return r
 	}, line)
-	line = truncate(line, maxLineLen-2) + "\r\n"
+	line = truncate(line, maxLineLen-2)
+	if c.caps["server-time"] && strings.HasPrefix(line, ":") {
+		line = "@time=" + t.UTC().Format("2006-01-02T15:04:05.000Z") + " " + line
+	}
+	line += "\r\n"
 	select {
 	case c.out <- line:
 	case <-c.done:
@@ -167,6 +179,10 @@ func (c *Client) readLoop() {
 	tc.SetDeadline(time.Now().Add(10 * time.Second))
 	if err := tc.Handshake(); err != nil {
 		return // client non-TLS ou handshake raté : on coupe sans rien répondre
+	}
+	if st := tc.ConnectionState(); len(st.PeerCertificates) > 0 {
+		sum := sha256.Sum256(st.PeerCertificates[0].Raw)
+		c.certfp = hex.EncodeToString(sum[:])
 	}
 	c.regDeadline = time.Now().Add(time.Duration(s.cfg.RegTimeout) * time.Second)
 	ping := time.Duration(s.cfg.PingInterval) * time.Second

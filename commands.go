@@ -42,6 +42,22 @@ func init() {
 		"INVITE":       {(*Server).cmdInvite, false, false, 2},
 		"AWAY":         {(*Server).cmdAway, false, false, 0},
 		"MOTD":         {func(s *Server, c *Client, _ *Message) { s.sendMOTD(c) }, false, false, 0},
+		"OPER":         {(*Server).cmdOper, false, true, 2},
+		"KILL":         {(*Server).cmdKill, false, false, 2},
+		"REHASH":       {(*Server).cmdRehash, false, true, 0},
+		"DIE":          {(*Server).cmdDie, false, false, 0},
+		"WALLOPS":      {(*Server).cmdWallops, false, false, 1},
+		"KLINE":        {(*Server).cmdKline, false, false, 1},
+		"UNKLINE":      {(*Server).cmdUnkline, false, false, 1},
+		"LUSERS":       {(*Server).cmdLusers, false, false, 0},
+		"VERSION":      {(*Server).cmdVersion, false, false, 0},
+		"TIME":         {(*Server).cmdTime, false, false, 0},
+		"INFO":         {(*Server).cmdInfo, false, false, 0},
+		"ADMIN":        {(*Server).cmdAdmin, false, false, 0},
+		"USERHOST":     {(*Server).cmdUserhost, false, false, 1},
+		"ISON":         {(*Server).cmdIson, false, false, 1},
+		"PASSWD":       {(*Server).cmdPasswd, false, true, 2},
+		"KNOCK":        {(*Server).cmdKnock, false, false, 1},
 	}
 }
 
@@ -74,23 +90,28 @@ func (s *Server) cmdCap(c *Client, m *Message) {
 	switch strings.ToUpper(m.Param(0)) {
 	case "LS":
 		c.capNegotiating = !c.registered
-		c.send(":%s CAP %s LS :sasl=PLAIN", s.cfg.Name, c.nickOr())
+		c.send(":%s CAP %s LS :sasl=PLAIN,EXTERNAL %s", s.cfg.Name, c.nickOr(), strings.Join(supportedCaps, " "))
 	case "LIST":
-		if c.saslCap {
-			c.send(":%s CAP %s LIST :sasl", s.cfg.Name, c.nickOr())
-		} else {
-			c.send(":%s CAP %s LIST :", s.cfg.Name, c.nickOr())
+		var on []string
+		for k, v := range c.caps {
+			if v {
+				on = append(on, k)
+			}
 		}
+		sort.Strings(on)
+		c.send(":%s CAP %s LIST :%s", s.cfg.Name, c.nickOr(), strings.Join(on, " "))
 	case "REQ":
 		reqs := strings.Fields(m.Param(1))
 		ok := len(reqs) > 0
 		for _, r := range reqs {
-			if r != "sasl" {
+			if !isSupportedCap(strings.TrimPrefix(r, "-")) {
 				ok = false
 			}
 		}
 		if ok {
-			c.saslCap = true
+			for _, r := range reqs {
+				c.caps[strings.TrimPrefix(r, "-")] = !strings.HasPrefix(r, "-")
+			}
 			c.send(":%s CAP %s ACK :%s", s.cfg.Name, c.nickOr(), m.Param(1))
 		} else {
 			c.send(":%s CAP %s NAK :%s", s.cfg.Name, c.nickOr(), m.Param(1))
@@ -101,6 +122,20 @@ func (s *Server) cmdCap(c *Client, m *Message) {
 	default:
 		c.numeric("410", m.Param(0), "Invalid CAP command")
 	}
+}
+
+var supportedCaps = []string{"away-notify", "echo-message", "extended-join", "multi-prefix", "server-time"}
+
+func isSupportedCap(n string) bool {
+	if n == "sasl" {
+		return true
+	}
+	for _, k := range supportedCaps {
+		if k == n {
+			return true
+		}
+	}
+	return false
 }
 
 // cmdPass : "PASS compte:motdepasse" (alternative à SASL pour les vieux clients).
@@ -122,22 +157,26 @@ func (s *Server) cmdPass(c *Client, m *Message) {
 
 func (s *Server) cmdAuthenticate(c *Client, m *Message) {
 	arg := m.Param(0)
-	if c.isRegistered() || !c.saslCap {
-		c.numeric("904", "SASL authentication failed")
+	fail := func(num, msg string) {
+		c.saslMech, c.saslBuf = "", ""
+		c.numeric(num, msg)
+	}
+	if c.isRegistered() || !c.caps["sasl"] {
+		fail("904", "SASL authentication failed")
 		return
 	}
 	if arg == "*" {
-		c.saslActive, c.saslBuf = false, ""
-		c.numeric("906", "SASL authentication aborted")
+		fail("906", "SASL authentication aborted")
 		return
 	}
-	if !c.saslActive {
-		if strings.ToUpper(arg) != "PLAIN" {
-			c.numeric("908", "PLAIN", "are available SASL mechanisms")
-			c.numeric("904", "SASL authentication failed")
+	if c.saslMech == "" {
+		mech := strings.ToUpper(arg)
+		if mech != "PLAIN" && mech != "EXTERNAL" {
+			c.numeric("908", "PLAIN,EXTERNAL", "are available SASL mechanisms")
+			fail("904", "SASL authentication failed")
 			return
 		}
-		c.saslActive, c.saslBuf = true, ""
+		c.saslMech, c.saslBuf = mech, ""
 		c.send("AUTHENTICATE +")
 		return
 	}
@@ -145,38 +184,52 @@ func (s *Server) cmdAuthenticate(c *Client, m *Message) {
 		c.saslBuf += arg
 	}
 	if len(c.saslBuf) > 1024 {
-		c.saslActive, c.saslBuf = false, ""
-		c.numeric("905", "SASL message too long")
+		fail("905", "SASL message too long")
 		return
 	}
 	if len(arg) == 400 { // fragment : on attend la suite
 		return
 	}
-	payload := c.saslBuf
-	c.saslActive, c.saslBuf = false, ""
+	mech, payload := c.saslMech, c.saslBuf
+	c.saslMech, c.saslBuf = "", ""
 	raw, err := base64.StdEncoding.DecodeString(payload)
-	parts := strings.Split(string(raw), "\x00")
-	if err != nil || len(parts) != 3 {
+	if err != nil {
 		c.numeric("904", "SASL authentication failed")
 		return
 	}
-	acct, pw := parts[1], parts[2]
-	if parts[0] != "" && fold(parts[0]) != fold(acct) {
-		c.numeric("904", "SASL authentication failed")
-		return
-	}
-	s.authenticate(c, acct, pw, func() {
+	onOK := func() {
 		s.mu.Lock()
 		nick := c.nickOr()
 		s.mu.Unlock()
 		c.numeric("900", nick+"!*@"+c.host, c.account, "You are now logged in as "+c.account)
 		c.numeric("903", "SASL authentication successful")
-	}, func() {
+	}
+	onFail := func() {
 		c.numeric("904", "SASL authentication failed")
 		if c.authFails++; c.authFails >= 3 {
 			c.shutdown("Too many authentication failures")
 		}
-	})
+	}
+	if mech == "EXTERNAL" {
+		s.mu.Lock()
+		acct, ok := s.certfp[c.certfp]
+		s.mu.Unlock()
+		if c.certfp == "" || !ok || !s.users.Exists(acct) || (len(raw) > 0 && fold(string(raw)) != fold(acct)) {
+			onFail()
+			return
+		}
+		s.mu.Lock()
+		c.account = fold(acct)
+		s.mu.Unlock()
+		onOK()
+		return
+	}
+	parts := strings.Split(string(raw), "\x00")
+	if len(parts) != 3 || (parts[0] != "" && fold(parts[0]) != fold(parts[1])) {
+		c.numeric("904", "SASL authentication failed")
+		return
+	}
+	s.authenticate(c, parts[1], parts[2], onOK, onFail)
 }
 
 // authenticate vérifie hors verrou (PBKDF2 est lent) puis fixe le compte.
@@ -264,10 +317,11 @@ func (s *Server) tryRegister(c *Client) {
 	c.numeric("001", "Welcome to the "+s.cfg.Network+" network, "+c.nick)
 	c.numeric("002", "Your host is "+s.cfg.Name+", running zinc")
 	c.numeric("003", "This server was created "+s.created.UTC().Format(time.RFC1123))
-	c.numeric("004", s.cfg.Name, "zinc", "-", "imnstklov")
-	c.numeric("005", "CHANTYPES=#", "PREFIX=(ov)@+", "CHANMODES=,k,l,imnst",
+	c.numeric("004", s.cfg.Name, "zinc-"+version, "o", "bimnRstklov")
+	c.numeric("005", "CHANTYPES=#", "PREFIX=(ov)@+", "CHANMODES=b,k,l,imnRst",
 		"NICKLEN="+itoa(maxNickLen), "CHANNELLEN="+itoa(maxChanLen), "TOPICLEN="+itoa(maxTopicLen),
 		"NETWORK="+s.cfg.Network, "CASEMAPPING=rfc1459", "are supported by this server")
+	s.cmdLusers(c, nil)
 	s.sendMOTD(c)
 }
 
@@ -293,6 +347,19 @@ func (s *Server) cmdQuit(c *Client, m *Message) {
 
 func (s *Server) cmdAway(c *Client, m *Message) {
 	c.away = truncate(m.Param(0), 200)
+	seen := map[*Client]bool{c: true}
+	for _, ch := range c.channels {
+		for mm := range ch.members {
+			if !seen[mm] && mm.caps["away-notify"] {
+				seen[mm] = true
+				if c.away == "" {
+					mm.send(":%s AWAY", c.prefix())
+				} else {
+					mm.send(":%s AWAY :%s", c.prefix(), c.away)
+				}
+			}
+		}
+	}
 	if c.away == "" {
 		c.numeric("305", "You are no longer marked as being away")
 	} else {
@@ -340,13 +407,35 @@ func (s *Server) join(c *Client, name, key string) {
 			return
 		}
 		ch = &Channel{name: name, created: time.Now().Unix(), members: map[*Client]*Member{},
-			invites: map[*Client]bool{}, noExternal: true, topicLock: true}
+			invites: map[*Client]bool{}}
+		for _, m := range s.cfg.DefaultModes {
+			switch m {
+			case 'i':
+				ch.inviteOnly = true
+			case 'm':
+				ch.moderated = true
+			case 'n':
+				ch.noExternal = true
+			case 'R':
+				ch.regOnly = true
+			case 's':
+				ch.secret = true
+			case 't':
+				ch.topicLock = true
+			}
+		}
 		ch.members[c] = &Member{op: true} // le créateur est opérateur
 		s.channels[k] = ch
 	} else {
 		switch {
+		case ch.isBanned(c) && !ch.invites[c]:
+			c.numeric("474", name, "Cannot join channel (+b)")
+			return
 		case ch.inviteOnly && !ch.invites[c]:
 			c.numeric("473", name, "Cannot join channel (+i)")
+			return
+		case ch.regOnly && c.account == "":
+			c.numeric("477", name, "Cannot join channel (+R): you need to be logged in")
 			return
 		case ch.key != "" && subtle.ConstantTimeCompare([]byte(ch.key), []byte(key)) != 1:
 			c.numeric("475", name, "Cannot join channel (+k)")
@@ -359,11 +448,26 @@ func (s *Server) join(c *Client, name, key string) {
 	}
 	delete(ch.invites, c)
 	c.channels[k] = ch
-	ch.broadcast(nil, ":%s JOIN %s", c.prefix(), ch.name)
+	acct := c.account
+	if acct == "" {
+		acct = "*"
+	}
+	for mm := range ch.members {
+		if mm.caps["extended-join"] {
+			mm.send(":%s JOIN %s %s :%s", c.prefix(), ch.name, acct, c.real)
+		} else {
+			mm.send(":%s JOIN %s", c.prefix(), ch.name)
+		}
+	}
 	if ch.topic != "" {
 		s.sendTopic(c, ch)
 	}
 	s.sendNames(c, ch)
+	if c.caps["server-time"] {
+		for _, e := range ch.history {
+			c.sendAt(e.t, "%s", e.line)
+		}
+	}
 }
 
 func (s *Server) cmdPart(c *Client, m *Message) {
@@ -412,11 +516,17 @@ func (s *Server) cmdPrivmsg(c *Client, m *Message) {
 				continue
 			}
 			mem := ch.members[c]
-			if (mem == nil && ch.noExternal) || (ch.moderated && (mem == nil || !mem.op && !mem.voice)) {
+			if (mem == nil && ch.noExternal) || (ch.moderated && (mem == nil || !mem.op && !mem.voice)) ||
+				(mem != nil && !mem.op && !mem.voice && ch.isBanned(c)) {
 				c.numeric("404", ch.name, "Cannot send to channel")
 				continue
 			}
-			ch.broadcast(c, ":%s %s %s :%s", c.prefix(), cmd, ch.name, text)
+			line := sprintf(":%s %s %s :%s", c.prefix(), cmd, ch.name, text)
+			ch.broadcast(c, "%s", line)
+			if c.caps["echo-message"] {
+				c.send("%s", line)
+			}
+			ch.addHistory(s.history, line)
 			continue
 		}
 		dst := s.clients[fold(t)]
@@ -425,6 +535,9 @@ func (s *Server) cmdPrivmsg(c *Client, m *Message) {
 			continue
 		}
 		dst.send(":%s %s %s :%s", c.prefix(), cmd, dst.nick, text)
+		if c.caps["echo-message"] {
+			c.send(":%s %s %s :%s", c.prefix(), cmd, dst.nick, text)
+		}
 		if dst.away != "" && cmd == "PRIVMSG" {
 			c.numeric("301", dst.nick, dst.away)
 		}
@@ -474,13 +587,7 @@ func (s *Server) sendNames(c *Client, ch *Channel) {
 	}
 	var nicks []string
 	for mm, mem := range ch.members {
-		p := ""
-		if mem.op {
-			p = "@"
-		} else if mem.voice {
-			p = "+"
-		}
-		nicks = append(nicks, p+mm.nick)
+		nicks = append(nicks, memberPrefix(mem, c.caps["multi-prefix"])+mm.nick)
 	}
 	sort.Strings(nicks)
 	var line []string
@@ -555,10 +662,11 @@ func (s *Server) whoLine(c *Client, chName string, t *Client, mem *Member) {
 	if t.away != "" {
 		flags = "G"
 	}
-	if mem != nil && mem.op {
-		flags += "@"
-	} else if mem != nil && mem.voice {
-		flags += "+"
+	if t.oper {
+		flags += "*"
+	}
+	if mem != nil {
+		flags += memberPrefix(mem, c.caps["multi-prefix"])
 	}
 	c.numeric("352", chName, t.user, t.host, s.cfg.Name, t.nick, flags, "0 "+t.real)
 }
@@ -575,13 +683,7 @@ func (s *Server) cmdWhois(c *Client, m *Message) {
 	var chans []string
 	for _, ch := range t.channels {
 		if !ch.secret || ch.members[c] != nil {
-			p := ""
-			if ch.members[t].op {
-				p = "@"
-			} else if ch.members[t].voice {
-				p = "+"
-			}
-			chans = append(chans, p+ch.name)
+			chans = append(chans, memberPrefix(ch.members[t], c.caps["multi-prefix"])+ch.name)
 		}
 	}
 	sort.Strings(chans)
@@ -591,6 +693,9 @@ func (s *Server) cmdWhois(c *Client, m *Message) {
 	c.numeric("312", t.nick, s.cfg.Name, s.cfg.Network)
 	if t.away != "" {
 		c.numeric("301", t.nick, t.away)
+	}
+	if t.oper {
+		c.numeric("313", t.nick, "is an IRC operator")
 	}
 	if t.account != "" {
 		c.numeric("330", t.nick, t.account, "is logged in as")
@@ -657,7 +762,16 @@ func (s *Server) cmdMode(c *Client, m *Message) {
 	if !strings.HasPrefix(target, "#") {
 		if fold(target) != fold(c.nick) {
 			c.numeric("502", "Cannot change mode for other users")
-		} else if len(m.Params) == 1 {
+			return
+		}
+		if len(m.Params) > 1 && strings.HasPrefix(m.Params[1], "-") && strings.Contains(m.Params[1], "o") {
+			c.oper = false
+			c.send(":%s MODE %s :-o", c.nick, c.nick)
+			return
+		}
+		if c.oper {
+			c.numeric("221", "+o")
+		} else {
 			c.numeric("221", "+")
 		}
 		return
@@ -679,6 +793,13 @@ func (s *Server) cmdMode(c *Client, m *Message) {
 	}
 	if mem == nil {
 		c.numeric("442", ch.name, "You're not on that channel")
+		return
+	}
+	if len(m.Params) == 2 && strings.TrimLeft(m.Params[1], "+") == "b" {
+		for _, b := range ch.bans {
+			c.numeric("367", ch.name, b)
+		}
+		c.numeric("368", ch.name, "End of channel ban list")
 		return
 	}
 	if !mem.op {
@@ -730,9 +851,39 @@ func (s *Server) cmdMode(c *Client, m *Message) {
 		case 'n':
 			ch.noExternal = add
 			emit(add, 'n', "")
+		case 'R':
+			ch.regOnly = add
+			emit(add, 'R', "")
 		case 's':
 			ch.secret = add
 			emit(add, 's', "")
+		case 'b':
+			mask, ok := next()
+			if !ok {
+				for _, b := range ch.bans {
+					c.numeric("367", ch.name, b)
+				}
+				c.numeric("368", ch.name, "End of channel ban list")
+				continue
+			}
+			mask = normalizeMask(mask)
+			idx := -1
+			for i, b := range ch.bans {
+				if b == mask {
+					idx = i
+				}
+			}
+			if add && idx < 0 {
+				if len(ch.bans) >= 50 {
+					c.numeric("478", ch.name, mask, "Channel ban list is full")
+					continue
+				}
+				ch.bans = append(ch.bans, mask)
+				emit(true, 'b', mask)
+			} else if !add && idx >= 0 {
+				ch.bans = append(ch.bans[:idx], ch.bans[idx+1:]...)
+				emit(false, 'b', mask)
+			}
 		case 't':
 			ch.topicLock = add
 			emit(add, 't', "")

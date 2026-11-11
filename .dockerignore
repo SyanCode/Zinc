@@ -1,0 +1,5 @@
+.git
+*.crt
+*.key
+users.json
+*.log
