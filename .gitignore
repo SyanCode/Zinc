@@ -1,0 +1,4 @@
+zinc
+*.crt
+*.key
+users.json
